@@ -1,0 +1,11 @@
+# OMC state dir (created by tooling, not part of the project)
+.omc/
+
+# build / packaging artifacts
+.venv-mac/
+build/
+dist/
+__pycache__/
+*.spec
+*.icns
+icon.iconset/

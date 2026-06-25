@@ -1,0 +1,38 @@
+name: Build Windows EXE
+
+# 在 Windows runner 上用 PyInstaller 打包出真正的 .exe。
+# PyInstaller 不能交叉编译，所以 Mac 上打不出 exe —— 用这个 CI 在云端的 Windows 上打。
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:        # 也可以在 Actions 页面手动点 "Run workflow"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install PyQt5 DrissionPage pyinstaller
+
+      # 三个版本一次性全打出来（.ico 在 Windows 上是原生格式，无需转换）
+      - name: Build all three GUIs
+        shell: pwsh
+        run: |
+          pyinstaller --onefile --windowed --icon=icon.ico --name="北大法典爬虫" --clean --noconfirm "北大法典爬虫GUI.py"
+          pyinstaller --onefile --windowed --icon=icon.ico --name="北大法宝爬虫下载附件版" --clean --noconfirm "北大法宝爬虫下载附件版GUI.py"
+          pyinstaller --onefile --windowed --icon=icon.ico --name="北大法宝爬虫不下载附件版" --clean --noconfirm "北大法宝爬虫不下载附件版GUI.py"
+
+      - name: Upload EXE artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkulaw-windows-exe
+          path: dist/*.exe
+          if-no-files-found: error
