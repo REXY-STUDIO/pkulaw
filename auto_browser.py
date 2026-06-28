@@ -37,6 +37,11 @@ _DIALOG_SELS = ['.el-dialog', '.el-dialog__wrapper', '[role=dialog]',
                 '.el-message-box', '.dialog', '.modal', '.popup',
                 '.layui-layer', '.van-dialog', '.ant-modal']   # CONFIRM-DOM
 _POPUP_KW = ('完善', '注册', '手机', '行业', '验证码', '登录')  # 配额弹窗 vs 普通对话框
+_RISK_MARKERS = ('访问频繁', '过于频繁', '操作频繁', '访问异常', '访问验证',
+                 '安全验证', '人机验证', '人机识别', '滑动验证', '拖动滑块',
+                 '完成验证', '请稍后再试', '访问受限', '拒绝访问', '访问被拒',
+                 '系统检测到您', '验证您的身份', 'Forbidden', 'forbidden',
+                 'Too Many Requests')  # CONFIRM-DOM：以真实风控页文案为准
 
 
 def _content_text(page):
@@ -76,6 +81,30 @@ def _popup_present(page):
 def content_is_clean(text):
     """保存前对已取出字符串做最终校验。True=干净可写。"""
     return bool(text and text.strip()) and not any(m in text for m in _JUNK_MARKERS)
+
+
+def detect_risk_control(page):
+    """检测是否被数据风控/反爬拦截(验证页/限频页/封禁页)。
+    正文关键词仅在“正常内容容器不存在”时才采信，避免误伤含敏感词的法规正文。
+    返回 (bool, 说明串)。命中即应停止整批并提醒用户不要继续。"""
+    try:
+        d = page.run_js(
+            "var has=!!(document.querySelector('.fulltext-wrap')"
+            "||document.querySelector('tbody tr')||document.querySelector('.content'));"
+            "var t=document.title||'';"
+            "var b=document.body?document.body.innerText.slice(0,600):'';"
+            "return (has?'1':'0')+'|||'+t+'|||'+b;"
+        ) or ''
+    except Exception:
+        return False, ''
+    has, _, rest = d.partition('|||')
+    title, _, body = rest.partition('|||')
+    for m in _RISK_MARKERS:
+        if m in title:
+            return True, '标题含「%s」' % m
+        if has == '0' and m in body:
+            return True, '页面含「%s」(且无正常内容)' % m
+    return False, ''
 
 
 def expand_full_text(page, log=print, timeout=12):
@@ -476,7 +505,7 @@ def download_batch(browser, urls_file, out_dir, n, wmin=1, wmax=3, log=print,
     if not total:
         log('urls 为空'); return 0
     ok = 0
-    stopped_by_popup = False
+    stop_reason = ''
     page = browser.new_tab()
     for i, url in enumerate(urls):
         if is_stopped and is_stopped():
@@ -484,14 +513,18 @@ def download_batch(browser, urls_file, out_dir, n, wmin=1, wmax=3, log=print,
         try:
             page.get(url)
             time.sleep(2)
+            rc, why = detect_risk_control(page)
+            if rc:
+                stop_reason = '检测到数据风控/反爬拦截（%s）：已停止下载，请不要继续，歇一会儿/换网络或账号后再试。' % why
+                log('⚠ ' + stop_reason); break
             w1 = page.ele('.fulltext-wrap', timeout=8)
             if not w1:
                 log(f'未找到正文容器(跳过): ...{url[-36:]}'); continue
             # 展开「继续阅读」+ 判配额弹窗（修复：原来只取到前 50% 正文 + 残留垃圾串）
             status = expand_full_text(page, log=log)
             if status == 'popup':
-                log('⚠ 账号已达下载上限（出现配额/注册弹窗），已停止本批下载。')
-                stopped_by_popup = True; break
+                stop_reason = '账号已达下载上限：出现配额/注册弹窗，已停止下载。请更换账号或稍后再试。'
+                log('⚠ ' + stop_reason); break
             if status == 'partial':
                 log(f'正文展开不完整，跳过(保留URL重试): ...{url[-36:]}'); continue
             w1 = page.ele('.fulltext-wrap', timeout=8)   # 展开后重新取，避免句柄过期
@@ -516,8 +549,8 @@ def download_batch(browser, urls_file, out_dir, n, wmin=1, wmax=3, log=print,
         page.close()
     except Exception:
         pass
-    if stopped_by_popup:
-        raise RuntimeError('账号已达下载上限：出现配额/注册弹窗，已停止下载。请更换账号或稍后再试。')
+    if stop_reason:
+        raise RuntimeError(stop_reason)
     return ok
 
 

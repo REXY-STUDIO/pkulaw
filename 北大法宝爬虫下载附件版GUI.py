@@ -22,6 +22,11 @@ _DIALOG_SELS = ['.el-dialog', '.el-dialog__wrapper', '[role=dialog]',
                 '.el-message-box', '.dialog', '.modal', '.popup',
                 '.layui-layer', '.van-dialog', '.ant-modal']   # CONFIRM-DOM
 _POPUP_KW = ('完善', '注册', '手机', '行业', '验证码', '登录')  # 配额弹窗 vs 普通对话框
+_RISK_MARKERS = ('访问频繁', '过于频繁', '操作频繁', '访问异常', '访问验证',
+                 '安全验证', '人机验证', '人机识别', '滑动验证', '拖动滑块',
+                 '完成验证', '请稍后再试', '访问受限', '拒绝访问', '访问被拒',
+                 '系统检测到您', '验证您的身份', 'Forbidden', 'forbidden',
+                 'Too Many Requests')  # CONFIRM-DOM：以真实风控页文案为准
 
 
 def _content_text(page):
@@ -61,6 +66,30 @@ def _popup_present(page):
 def content_is_clean(text):
     """保存前对已取出字符串做最终校验。True=干净可写。"""
     return bool(text and text.strip()) and not any(m in text for m in _JUNK_MARKERS)
+
+
+def detect_risk_control(page):
+    """检测是否被数据风控/反爬拦截(验证页/限频页/封禁页)。
+    正文关键词仅在“正常内容容器不存在”时才采信，避免误伤含敏感词的法规正文。
+    返回 (bool, 说明串)。命中即应停止整批并提醒用户不要继续。"""
+    try:
+        d = page.run_js(
+            "var has=!!(document.querySelector('.fulltext-wrap')"
+            "||document.querySelector('tbody tr')||document.querySelector('.content'));"
+            "var t=document.title||'';"
+            "var b=document.body?document.body.innerText.slice(0,600):'';"
+            "return (has?'1':'0')+'|||'+t+'|||'+b;"
+        ) or ''
+    except Exception:
+        return False, ''
+    has, _, rest = d.partition('|||')
+    title, _, body = rest.partition('|||')
+    for m in _RISK_MARKERS:
+        if m in title:
+            return True, '标题含「%s」' % m
+        if has == '0' and m in body:
+            return True, '页面含「%s」(且无正常内容)' % m
+    return False, ''
 
 
 def expand_full_text(page, log=print, timeout=12):
@@ -168,16 +197,19 @@ class CrawlerThread(QThread):
         try:
             # 重置爬虫状态
             self.crawler.state = 1
-            self.crawler.stopped_by_popup = False
+            self.crawler.stop_reason = ''
 
             if self.mode == 'collect':
                 self.crawler.collect_urls(self)
+                if getattr(self.crawler, 'stop_reason', ''):
+                    self.finished_signal.emit(False, self.crawler.stop_reason)
+                    return
                 remaining = len(self.crawler.read_urls_from_file())
                 self.finished_signal.emit(True, f"本页URL收集完成，当前共有{remaining}个URL待下载")
             elif self.mode == 'download':
                 self.crawler.download_content(self)
-                if getattr(self.crawler, 'stopped_by_popup', False):
-                    self.finished_signal.emit(False, "账号已达下载上限（出现注册/配额弹窗），已停止。请更换账号或稍后再试。")
+                if getattr(self.crawler, 'stop_reason', ''):
+                    self.finished_signal.emit(False, self.crawler.stop_reason)
                     return
                 remaining = len(self.crawler.read_urls_from_file())
                 if remaining > 0:
@@ -257,10 +289,22 @@ class PkulawCrawler:
             target = self.page.ele('tag:tbody')
 
             if not target:
-                if thread:
-                    thread.update_signal.emit("未找到tbody元素，请确认页面已正确加载")
+                rc, why = detect_risk_control(self.page)
+                if rc:
+                    msg = ('⚠ 检测到数据风控/反爬拦截（%s）。已停止，请不要继续操作；'
+                           '建议歇一会儿、换网络或换账号后再试。' % why)
+                    if thread:
+                        thread.update_signal.emit(msg)
+                    else:
+                        print(msg)
+                    self.state = 0
+                    self.stop_reason = msg
                 else:
-                    print("未找到tbody元素，请确认页面已正确加载")
+                    tip = "未找到tbody元素，请确认页面已正确加载（若反复出现，可能是被风控拦截，请先停手）"
+                    if thread:
+                        thread.update_signal.emit(tip)
+                    else:
+                        print(tip)
                 return
             
             # print(now_url)
@@ -368,6 +412,19 @@ class PkulawCrawler:
                 # 下载内容
                 page.get(url)
                 time.sleep(2)
+
+                # 风控/反爬拦截检测：命中立即停止整批，别再请求（避免越撞越狠）
+                rc, why = detect_risk_control(page)
+                if rc:
+                    msg = ('⚠ 检测到数据风控/反爬拦截（%s）。已停止下载，请不要继续操作；'
+                           '建议歇一会儿、换网络或换账号后再试。' % why)
+                    if thread:
+                        thread.update_signal.emit(msg)
+                    else:
+                        print(msg)
+                    self.stop_reason = msg
+                    self.state = 0
+                    break
                 
                 # 获取文本内容
                 # wenben1 = page.ele('.fields').text
@@ -383,7 +440,7 @@ class PkulawCrawler:
                         thread.update_signal.emit(msg)
                     else:
                         print(msg)
-                    self.stopped_by_popup = True
+                    self.stop_reason = msg
                     self.state = 0          # 复用既有“致命错误停止”机制
                     break
                 if status == 'partial':
