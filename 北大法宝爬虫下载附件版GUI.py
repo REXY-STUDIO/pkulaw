@@ -9,6 +9,150 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
 
+
+# ============================================================================
+# 「继续阅读」展开 + 配额/注册弹窗检测（启发式 + 自诊断日志）
+# 本函数在 auto_browser.py 与三个独立 GUI 里各有一份字节一致的拷贝
+# （三个 GUI 用 PyInstaller --onefile 打包，不便共享 import，故复制；改一处要四处同步）。
+# 标 CONFIRM-DOM 的选择器是启发式猜测，命中后会 log 出真实值，便于回填收紧。
+# ============================================================================
+_JUNK_MARKERS = ('剩余', '未阅读', '继续阅读')          # CONFIRM-DOM：以真实残留串为准
+_CONTENT_SELS = ('.content', '.fulltext')              # CONFIRM-DOM：不同版本正文容器
+_DIALOG_SELS = ['.el-dialog', '.el-dialog__wrapper', '[role=dialog]',
+                '.el-message-box', '.dialog', '.modal', '.popup',
+                '.layui-layer', '.van-dialog', '.ant-modal']   # CONFIRM-DOM
+_POPUP_KW = ('完善', '注册', '手机', '行业', '验证码', '登录')  # 配额弹窗 vs 普通对话框
+
+
+def _content_text(page):
+    """读正文容器文本（DOM 级）。.content 不在则退回 .fulltext（法典老版）。"""
+    try:
+        js = ("var ss=" + repr(list(_CONTENT_SELS)).replace("'", '"') + ";"
+              "for(var i=0;i<ss.length;i++){var c=document.querySelector(ss[i]);"
+              "if(c)return c.innerText;}return '';")
+        return page.run_js(js) or ''
+    except Exception:
+        return ''
+
+
+def _popup_present(page):
+    """页面上是否有可见且含配额关键词的对话框。返回 (bool, 说明串)。"""
+    try:
+        js = (
+            "function vis(el){if(!el)return false;var s=getComputedStyle(el);"
+            "if(s.display==='none'||s.visibility==='hidden'||parseFloat(s.opacity)===0)return false;"
+            "var r=el.getBoundingClientRect();return r.width>0&&r.height>0;}"
+            "var sels=" + repr(_DIALOG_SELS).replace("'", '"') + ";"
+            "var kw=" + repr(list(_POPUP_KW)).replace("'", '"') + ";"
+            "for(var i=0;i<sels.length;i++){var ns=document.querySelectorAll(sels[i]);"
+            "for(var j=0;j<ns.length;j++){if(vis(ns[j])){var t=(ns[j].innerText||'');"
+            "for(var k=0;k<kw.length;k++){if(t.indexOf(kw[k])>-1)"
+            "return sels[i]+'|||'+t.slice(0,80);}}}}return '';"
+        )
+        hit = page.run_js(js)
+    except Exception:
+        return False, ''
+    if hit:
+        sel, _, txt = hit.partition('|||')
+        return True, '%s 文本「%s」' % (sel, txt)
+    return False, ''
+
+
+def content_is_clean(text):
+    """保存前对已取出字符串做最终校验。True=干净可写。"""
+    return bool(text and text.strip()) and not any(m in text for m in _JUNK_MARKERS)
+
+
+def expand_full_text(page, log=print, timeout=12):
+    """点开「继续阅读」展开正文后半段，并判定是否触发配额/注册弹窗。
+
+    返回:
+      'ok'      正文已完整（无残留标记、无弹窗）
+      'popup'   出现配额/注册弹窗 -> 调用方应停止整批并告警
+      'partial' 没展开干净 -> 调用方应跳过该篇、不写文件
+    """
+    import time  # 局部 import，保证独立 GUI 直接粘贴可用
+
+    # 0. 开页即弹的配额弹窗（少数情况）
+    present, why = _popup_present(page)
+    if present:
+        log('⚠ 开页即检测到配额/注册弹窗（%s）→ 账号疑似已达上限' % why)
+        return 'popup'
+
+    # 1. 找「继续阅读」展开控件（启发式：按可见文本扫可点元素）
+    find_js = (
+        "var ms=" + repr(list(_JUNK_MARKERS)).replace("'", '"') + ";"
+        "var cs=document.querySelectorAll('a,button,span,div,p');"
+        "for(var i=0;i<cs.length;i++){var e=cs[i];var t=(e.innerText||'').trim();"
+        "if(t.length<40){for(var k=0;k<ms.length;k++){if(t.indexOf(ms[k])>-1){"
+        "var r=e.getBoundingClientRect();if(r.width>0&&r.height>0)"
+        "return e.tagName+'|||'+(e.className||'')+'|||'+t;}}}}return '';"
+    )
+    try:
+        info = page.run_js(find_js)
+    except Exception:
+        info = ''
+    if not info:
+        # 没找到展开控件：可能本就是短文书（已完整）；用残留标记区分，避免误判
+        if any(m in _content_text(page) for m in _JUNK_MARKERS):
+            log('⚠ 未找到「继续阅读」控件但正文仍含残留标记 → partial（请把本行上下文日志发我校正选择器）')
+            return 'partial'
+        return 'ok'
+    log('命中展开控件：' + info.replace('|||', ' / '))   # 自诊断：回填精确选择器用
+
+    # 2. 点击展开（text 定位 + by_js 兜底）
+    expander = None
+    for finder in (lambda: page.ele('text:继续阅读', timeout=1),
+                   lambda: page.ele('text:未阅读', timeout=1),
+                   lambda: page.ele('xpath://*[contains(text(),"继续阅读")]', timeout=1)):
+        try:
+            e = finder()
+            if e:
+                expander = e
+                break
+        except Exception:
+            continue
+    if expander:
+        try:
+            try:
+                expander.scroll.to_see()
+            except Exception:
+                pass
+            try:
+                expander.click()
+            except Exception:
+                expander.click(by_js=True)
+        except Exception as ex:
+            log('点击「继续阅读」失败：%s' % ex)
+            present, why = _popup_present(page)
+            return 'popup' if present else 'partial'
+
+    # 3. 等待：正文补全（残留消失 + 长度稳定）或弹窗出现
+    last_len, stable = -1, 0
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.5)
+        present, why = _popup_present(page)
+        if present:
+            log('⚠ 点击后出现配额/注册弹窗（%s）→ 账号已达上限，停止整批' % why)
+            return 'popup'
+        txt = _content_text(page)
+        has_junk = any(m in txt for m in _JUNK_MARKERS)
+        cur = len(txt)
+        stable = stable + 1 if (cur == last_len and cur > 0) else 0
+        last_len = cur
+        if (not has_junk) and stable >= 2:
+            log('正文已展开完整（%d字）' % cur)
+            return 'ok'
+
+    # 4. 超时兜底
+    if any(m in _content_text(page) for m in _JUNK_MARKERS):
+        log('展开等待超时，正文仍含残留标记 → partial')
+        return 'partial'
+    log('展开等待超时，未见残留标记，按 ok 处理')
+    return 'ok'
+
+
 class CrawlerThread(QThread):
     """爬虫线程，避免界面卡死"""
     update_signal = pyqtSignal(str)
@@ -24,13 +168,17 @@ class CrawlerThread(QThread):
         try:
             # 重置爬虫状态
             self.crawler.state = 1
-            
+            self.crawler.stopped_by_popup = False
+
             if self.mode == 'collect':
                 self.crawler.collect_urls(self)
                 remaining = len(self.crawler.read_urls_from_file())
                 self.finished_signal.emit(True, f"本页URL收集完成，当前共有{remaining}个URL待下载")
             elif self.mode == 'download':
                 self.crawler.download_content(self)
+                if getattr(self.crawler, 'stopped_by_popup', False):
+                    self.finished_signal.emit(False, "账号已达下载上限（出现注册/配额弹窗），已停止。请更换账号或稍后再试。")
+                    return
                 remaining = len(self.crawler.read_urls_from_file())
                 if remaining > 0:
                     self.finished_signal.emit(True, f"本批次下载完成，还有{remaining}个URL待下载")
@@ -226,6 +374,26 @@ class PkulawCrawler:
                 # wenben2 = page.ele('.fulltext').text
                 # wenben = wenben1 + '\n' + wenben2
                 wenben1 = page.ele('.fulltext-wrap')
+
+                # 展开「继续阅读」+ 判配额弹窗（修复：原来只取到前 50% 正文 + 残留垃圾串）
+                status = expand_full_text(page, log=(thread.update_signal.emit if thread else print))
+                if status == 'popup':
+                    msg = '⚠ 账号已达下载上限（出现“完善信息”注册/配额弹窗），已停止下载。请更换账号或稍后再试。'
+                    if thread:
+                        thread.update_signal.emit(msg)
+                    else:
+                        print(msg)
+                    self.stopped_by_popup = True
+                    self.state = 0          # 复用既有“致命错误停止”机制
+                    break
+                if status == 'partial':
+                    if thread:
+                        thread.update_signal.emit(f'正文展开不完整，跳过(保留URL重试): {url}')
+                    else:
+                        print(f'正文展开不完整，跳过(保留URL重试): {url}')
+                    continue                # 不删 URL、不写文件，下次可重试
+
+                wenben1 = page.ele('.fulltext-wrap')   # 展开后重新取，避免句柄过期
                 title = wenben1.ele('.title').text
                 wenben = wenben1.ele('.content').text
                 try:
@@ -249,6 +417,14 @@ class PkulawCrawler:
                     if c in title:
                         title = title.replace(c, '某')
                 
+                # 保存前校验：正文若仍含残留标记则跳过不写（避免存半截垃圾文件）
+                if not content_is_clean(wenben):
+                    if thread:
+                        thread.update_signal.emit(f'正文仍含残留标记，跳过不保存: {url}')
+                    else:
+                        print(f'正文仍含残留标记，跳过不保存: {url}')
+                    continue
+
                 # 保存到文件
                 file_path = os.path.join(self.folder_path, f'{title}.txt')
                 with open(file_path, 'w', encoding='utf-8') as f:
